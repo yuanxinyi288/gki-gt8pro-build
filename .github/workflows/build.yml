@@ -1,0 +1,234 @@
+name: Build GT8 Pro GKI Kernel
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /usr/local/share/boost /usr/share/swift /usr/local/lib/node_modules /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+
+      - name: Create swap
+        run: |
+          sudo fallocate -l 12G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=12288
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install repo
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name "gki-builder"
+          git config --global user.email "gki-builder@users.noreply.github.com"
+
+      - name: Sync GKI tree
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/kernel"
+          cd "$GITHUB_WORKSPACE/kernel"
+          for BR in common-android16-6.12-2026-03 common-android16-6.12; do
+            if repo init -u https://android.googlesource.com/kernel/manifest -b "$BR" --depth=1; then
+              echo "manifest branch: $BR" | tee "$GITHUB_WORKSPACE/branch.txt"
+              break
+            fi
+          done
+          repo sync -c --no-tags --no-clone-bundle --current-branch -j8
+
+      - name: Pin stock 6.12.69 commit
+        working-directory: ${{ github.workspace }}/kernel/common
+        run: |
+          set -euxo pipefail
+          git fetch --depth=1 https://android.googlesource.com/kernel/common 5fd39602326e
+          git checkout FETCH_HEAD
+          grep -E '^VERSION|^PATCHLEVEL|^SUBLEVEL' Makefile
+
+      - name: Integrate KernelSU-Next v3.4.2
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -euxo pipefail
+          curl -LSs https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/v3.4.2/kernel/setup.sh | bash -s v3.4.2
+          test -L common/drivers/kernelsu
+
+      - name: Apply config fragment
+        working-directory: ${{ github.workspace }}/kernel/common
+        run: |
+          cat > gt8pro.fragment <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_KALLSYMS_ALL=y
+          CONFIG_KPROBES=y
+          CONFIG_OVERLAY_FS=y
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          EOF
+          cat gt8pro.fragment
+
+      - name: Remove GKI protected exports
+        working-directory: ${{ github.workspace }}/kernel/common
+        run: |
+          sed -i '/protected_module_names_list/d' BUILD.bazel
+          sed -i '/protected_exports_list/d' BUILD.bazel
+          rm -f android/abi_gki_protected_exports_* || true
+          grep -n 'protected' BUILD.bazel || true
+
+      - name: Build kernel
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -o pipefail
+          tools/bazel build --config=fast --notrim --defconfig_fragment=//common:gt8pro.fragment //common:kernel_aarch64 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Verify Image and config
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euxo pipefail
+          IMG="kernel/bazel-bin/common/kernel_aarch64/Image"
+          test -f "$IMG"
+          cp "$IMG" Image
+          size=$(stat -c%s Image)
+          echo "Image size: $size"
+          test "$size" -gt 25000000
+          python3 - <<'PY'
+          d = open('Image', 'rb').read(64)
+          assert d[:2] == b'MZ', d[:2]
+          assert d[56:60] == b'ARM\x64', d[56:60]
+          print('arm64 Image header OK')
+          PY
+          kernel/common/scripts/extract-ikconfig Image > built.config
+          test -s built.config
+          for c in CONFIG_KSU=y CONFIG_KALLSYMS_ALL=y CONFIG_KPROBES=y CONFIG_PREEMPT=y CONFIG_MODVERSIONS=y CONFIG_MODULE_SIG=y; do
+            grep -qx "$c" built.config
+          done
+          ! grep -q 'CONFIG_MODULE_SIG_FORCE=y' built.config
+          strings Image | grep -m1 'Linux version'
+          echo '--- KSU config block ---'
+          grep -E '^#?[[:space:]]?CONFIG_KSU' built.config || true
+          echo 'config checks passed'
+
+      - name: Package AnyKernel3
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          rm -rf ak3/.git ak3/Image* ak3/dtb ak3/modules ak3/ramdisk*
+          cp Image ak3/Image
+          cat > ak3/anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+
+          properties() { '
+          kernel.string=realme GT8 Pro (RMX5200) GKI 6.12.69 + KernelSU-Next v3.4.2
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          do.check_boot_version=0
+          device.name1=
+          device.name2=
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          keycheck.timeout=10
+          '; }
+
+          block=boot
+          is_slot_device=auto
+          ramdisk_compression=auto
+          patch_vbmeta_flag=auto
+          no_magisk_check=1
+
+          . tools/ak3-core.sh
+
+          kernel_version=$(cat /proc/version | awk -F '-' '{print $1}' | awk '{print $3}')
+          case $kernel_version in
+              6.12*) ksu_supported=true ;;
+              *) ksu_supported=false ;;
+          esac
+          ui_print " " "  -> GT8 Pro GKI 6.12 supported: $ksu_supported"
+          $ksu_supported || abort "  -> Non-6.12 GKI device, abort."
+
+          split_boot
+          if [ -f "$SPLITIMG/ramdisk.cpio" ]; then
+              unpack_ramdisk
+              write_boot
+          else
+              flash_boot
+          fi
+          EOF
+          (cd ak3 && zip -r9 "$GITHUB_WORKSPACE/GT8Pro-GKI-6.12.69-KSUN-AnyKernel3.zip" . -x '*.git*')
+
+      - name: Fetch add-on packages
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euxo pipefail
+          curl -fL -o android16-6.12_susfs_guard_lkm.ko https://github.com/KernelSU-Next/KernelSU-Next/releases/download/v3.4.2/android16-6.12_susfs_guard_lkm.ko
+          curl -fL -o KernelSU_Next_v3.4.2_33355-release.apk https://github.com/KernelSU-Next/KernelSU-Next/releases/download/v3.4.2/KernelSU_Next_v3.4.2_33355-release.apk
+          curl -fL -o KPatch-Next-Module.zip https://github.com/KernelSU-Next/KPatch-Next-Module/releases/download/v0.0.1/KPatch-Next-Module.zip
+
+      - name: Checksums and release notes
+        working-directory: ${{ github.workspace }}
+        run: |
+          sha256sum Image GT8Pro-GKI-6.12.69-KSUN-AnyKernel3.zip android16-6.12_susfs_guard_lkm.ko KernelSU_Next_v3.4.2_33355-release.apk KPatch-Next-Module.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          {
+            echo 'GKI 6.12.69 build for realme GT8 Pro (RMX5200), ColorOS 17 / Android 17.'
+            echo ''
+            echo '- Base: AOSP kernel/common android16-6.12, stock commit 5fd39602326e (Linux 6.12.69)'
+            echo '- Root: KernelSU-Next v3.4.2 built-in (CONFIG_KSU=y)'
+            echo '- Config: KALLSYMS_ALL / KPROBES enabled for KPatch-Next (KPM)'
+            echo '- SUSFS: official KernelSU-Next v3.4.2 SUSFS guard LKM included'
+            echo '- GKI protected exports removed; built with --notrim for stock vendor_dlkm compatibility'
+            echo ''
+            echo 'Flash: bootloader unlocked required. Use a custom recovery / KernelFlasher to flash the AnyKernel3 zip on the active boot slot.'
+          } > release-notes.md
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: GT8Pro-GKI-6.12.69-KSUN
+          path: |
+            Image
+            built.config
+            build.log
+            GT8Pro-GKI-6.12.69-KSUN-AnyKernel3.zip
+            SHA256SUMS.txt
+            android16-6.12_susfs_guard_lkm.ko
+            KernelSU_Next_v3.4.2_33355-release.apk
+            KPatch-Next-Module.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: gt8pro-${{ github.run_number }}
+          name: GT8 Pro GKI 6.12.69 KernelSU-Next v3.4.2 (build ${{ github.run_number }})
+          body_path: release-notes.md
+          files: |
+            Image
+            built.config
+            GT8Pro-GKI-6.12.69-KSUN-AnyKernel3.zip
+            SHA256SUMS.txt
+            android16-6.12_susfs_guard_lkm.ko
+            KernelSU_Next_v3.4.2_33355-release.apk
+            KPatch-Next-Module.zip
